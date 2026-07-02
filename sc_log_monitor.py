@@ -173,17 +173,31 @@ def _show_message(title: str, message: str) -> None:
 # Discord embed upload
 # ---------------------------------------------------------------------------
 
+def _check_discord_ready(webhook_url: str, user_id: str, guild_token: str,
+                         on_failure) -> bool:
+    """Return True if all Discord credentials are present, else call on_failure and return False."""
+    if not webhook_url:
+        on_failure("Discord webhook URL is not configured.\nGo to Settings → Discord to add it.")
+        return False
+    if not guild_token:
+        on_failure("Guild Token is not configured.\nGo to Settings → Discord to add it.")
+        return False
+    if not user_id:
+        on_failure(
+            "Discord account is not linked yet.\n"
+            "Run /blueprint-link in Discord, then go to Settings → Discord → Link Account."
+        )
+        return False
+    return True
+
+
 def post_blueprint_embed(webhook_url: str, user_id: str, guild_token: str,
                          item: str, timestamp: str, on_failure) -> None:
     """POST a single blueprint as a Discord embed via webhook.
 
     Runs in the calling thread — callers should spawn a daemon thread.
     """
-    if not webhook_url:
-        on_failure("Discord webhook URL is not configured.")
-        return
-    if not user_id or not guild_token:
-        on_failure("Discord account not linked. Use Settings → Discord → Link Account.")
+    if not _check_discord_ready(webhook_url, user_id, guild_token, on_failure):
         return
     try:
         payload = {
@@ -208,6 +222,8 @@ def post_blueprint_embed(webhook_url: str, user_id: str, guild_token: str,
 def resend_all_from_local(webhook_url: str, user_id: str, guild_token: str,
                           output_dir: Path, on_failure) -> None:
     """Re-send every entry in blueprints.json as individual embeds."""
+    if not _check_discord_ready(webhook_url, user_id, guild_token, on_failure):
+        return
     entries = _load_all_blueprints(output_dir)
     if not entries:
         _show_message("SC Log Monitor", "No local blueprints found — nothing to resend.")

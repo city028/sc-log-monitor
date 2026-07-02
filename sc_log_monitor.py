@@ -579,6 +579,19 @@ def show_settings_dialog(on_saved):
         tk.Button(tab_disc, text="Link Account", command=do_link).grid(
             row=8, column=1, sticky="w", **pad)
 
+        ttk.Separator(tab_disc, orient="horizontal").grid(
+            row=9, column=0, columnspan=3, sticky="we", pady=6)
+
+        def do_reset():
+            hook_var.set("")
+            gt_var.set("")
+            uid_var.set("")
+            token_var.set("")
+            link_status.set("")
+
+        tk.Button(tab_disc, text="Reset Discord Settings", command=do_reset,
+                  foreground="red").grid(row=10, column=1, sticky="w", **pad)
+
         # ── Save / Cancel ─────────────────────────────────────────────────
         btn_frame = tk.Frame(root)
         btn_frame.pack(pady=8)

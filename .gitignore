@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime data — excluded from repo
+data/
+bak/
+
+# Sync tool
+sync.ffs_db
+
+# Secrets — config contains webhook URL, exclude from public repo
+config.ini

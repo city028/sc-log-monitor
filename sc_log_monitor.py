@@ -1,19 +1,20 @@
 """
 SC Log Monitor — real-time Star Citizen log watcher.
-Detects in-game events (aUEC payouts, blueprint drops, …) and writes
-them to per-day XML files in the configured output directory.
+Detects blueprint drops, appends them to a persistent blueprints.json,
+and uploads the file to Discord at end of session.
 """
 
 import os
 import re
-import sys
 import time
+import shutil
 import threading
 import configparser
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
+import json
+import requests
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
@@ -23,159 +24,198 @@ from PIL import Image, ImageDraw, ImageFont
 
 CONFIG_FILE = Path(__file__).parent / "config.ini"
 
+
+def _get_documents_dir() -> Path:
+    """Return the user's configured Documents folder (handles OneDrive redirection)."""
+    try:
+        import ctypes, ctypes.wintypes
+        buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+        ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf)  # CSIDL_PERSONAL
+        return Path(buf.value)
+    except Exception:
+        return Path.home() / "Documents"
+
+
+def _default_output_dir() -> Path:
+    return _get_documents_dir() / "Blueprints"
+
+
+def _default_bak_dir() -> Path:
+    return _get_documents_dir() / "Blueprints" / "bak"
+
+
 def load_config() -> configparser.ConfigParser:
     config = configparser.ConfigParser()
     config.read(CONFIG_FILE, encoding="utf-8")
     return config
 
 
+def save_config(log_file: str, output_dir: str, bak_dir: str,
+                webhook_url: str, poll_interval: str, max_backups: str) -> None:
+    """Write all settings back to config.ini."""
+    config = configparser.ConfigParser()
+    config.read(CONFIG_FILE, encoding="utf-8")
+
+    if not config.has_section("paths"):
+        config.add_section("paths")
+    config.set("paths", "log_file",    log_file)
+    config.set("paths", "output_dir",  output_dir)
+    config.set("paths", "bak_dir",     bak_dir)
+    config.set("paths", "max_backups", max_backups)
+
+    if not config.has_section("monitor"):
+        config.add_section("monitor")
+    config.set("monitor", "poll_interval", poll_interval)
+
+    if not config.has_section("discord"):
+        config.add_section("discord")
+    config.set("discord", "webhook_url", webhook_url)
+
+    with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+        config.write(fh)
+
+
 # ---------------------------------------------------------------------------
 # Event patterns
-#
-# To add a new event type, append a dict to PATTERNS with:
-#   name     – human-readable label
-#   regex    – compiled pattern; must match lines that carry the event
-#   build    – callable(re.Match) → dict of XML attributes (without "type")
-#   cooldown – (optional) seconds to suppress duplicate matches; useful when
-#              a single in-game event produces many matching log lines
 # ---------------------------------------------------------------------------
 
-def _strip_id_suffix(name: str) -> str:
-    """Remove trailing numeric ID from entity/vehicle names (e.g. DRAK_Golem_OX_629940747186)."""
-    return re.sub(r'_\d+$', '', name.strip())
-
-
 PATTERNS = [
-    {
-        "name": "aUEC",
-        "regex": re.compile(r'Added notification "Awarded (\d+) aUEC'),
-        "build": lambda m: {"amount": m.group(1)},
-    },
     {
         "name": "blueprint",
         "regex": re.compile(r'Added notification "Received Blueprint: (.+?):\s*"'),
         "build": lambda m: {"item": m.group(1).strip()},
     },
-    {
-        # Vehicle destroyed while you were pilot — collision with terrain/entity
-        "name": "death_vehicle",
-        "regex": re.compile(
-            r'<FatalCollision> Fatal Collision occured for vehicle (\S+)'
-            r'.*?Zone: (\w+), PlayerPilot: 1\]'
-            r' after hitting entity: ([^\[]+)'
-        ),
-        "build": lambda m: {
-            "ship":       _strip_id_suffix(m.group(1)),
-            "zone":       m.group(2),
-            "hit_entity": _strip_id_suffix(m.group(3)),
-        },
-    },
-    {
-        # On-foot death (player killed, suffocation, etc.)
-        # This log line fires once per equipped item — cooldown collapses them
-        # into a single event.
-        "name": "death_onfoot",
-        "regex": re.compile(r'CSCActorCorpseUtils::PopulateItemPortForItemRecoveryEntitlement'),
-        "build": lambda m: {},
-        "cooldown": 10,   # seconds
-    },
 ]
 
 
 # ---------------------------------------------------------------------------
-# XML persistence — one file per calendar day, events appended in real time
+# Persistent JSON store — single blueprints.json that grows over time
 # ---------------------------------------------------------------------------
 
-_xml_lock = threading.Lock()
+_file_lock = threading.Lock()
 
 
-def _daily_path(output_dir: Path) -> Path:
-    return output_dir / f"{datetime.now().strftime('%Y-%m-%d')}.xml"
+def _blueprints_path(output_dir: Path) -> Path:
+    return output_dir / "blueprints.json"
 
 
-def append_event(output_dir: Path, event_type: str, attrs: dict) -> None:
-    """Append one event element to today's XML file, creating it if needed."""
+def append_blueprint(output_dir: Path, bak_dir: Path, item: str,
+                     max_backups: int = 10) -> None:
+    """Backup blueprints.json then append the new entry."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = _daily_path(output_dir)
+    path = _blueprints_path(output_dir)
 
-    with _xml_lock:
+    with _file_lock:
+        # Backup before every write, keeping only max_backups most recent
         if path.exists():
-            tree = ET.parse(path)
-            root = tree.getroot()
+            bak_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.copy2(path, bak_dir / f"blueprints_{stamp}.json")
+            existing = sorted(bak_dir.glob("blueprints_*.json"))
+            for old in existing[:-max_backups]:
+                old.unlink(missing_ok=True)
+
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
         else:
-            root = ET.Element("log", date=datetime.now().strftime("%Y-%m-%d"))
-            tree = ET.ElementTree(root)
+            data = []
 
-        all_attrs = {
-            "type": event_type,
+        data.append({
+            "item":      item,
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-        all_attrs.update(attrs)
-        ET.SubElement(root, "event", **all_attrs)
+        })
 
-        ET.indent(root, space="  ")
-        tree.write(path, encoding="unicode", xml_declaration=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
 
 
-def _load_daily_totals(output_dir: Path) -> tuple[int, int, int, int]:
-    """Read today's XML and return (auec, blueprints, deaths, events)."""
-    path = _daily_path(output_dir)
+def _load_total_blueprints(output_dir: Path) -> int:
+    """Return the total number of blueprints recorded across all sessions."""
+    path = _blueprints_path(output_dir)
     if not path.exists():
-        return 0, 0, 0, 0
+        return 0
     try:
-        root = ET.parse(path).getroot()
-        auec = blueprints = deaths = events = 0
-        for ev in root.findall("event"):
-            t = ev.get("type", "")
-            events += 1
-            if t == "aUEC":
-                auec += int(ev.get("amount", 0))
-            elif t == "blueprint":
-                blueprints += 1
-            elif t in ("death_vehicle", "death_onfoot"):
-                deaths += 1
-        return auec, blueprints, deaths, events
+        with open(path, "r", encoding="utf-8") as fh:
+            return len(json.load(fh))
     except Exception:
-        return 0, 0, 0, 0
+        return 0
 
 
 # ---------------------------------------------------------------------------
-# Log tailer — follows Game.log, restarts automatically on file replacement
-# (Star Citizen creates a fresh Game.log each session)
+# Discord upload
+# ---------------------------------------------------------------------------
+
+def upload_to_discord(webhook_url: str, json_path: Path, summary: str,
+                      on_failure) -> None:
+    """POST json_path to a Discord webhook with a summary message."""
+    if not webhook_url:
+        on_failure("Discord webhook URL is not configured.")
+        return
+    try:
+        with open(json_path, "rb") as fh:
+            resp = requests.post(
+                webhook_url,
+                files={"file": (json_path.name, fh, "application/json")},
+                data={"content": summary},
+                timeout=15,
+            )
+        if not resp.ok:
+            on_failure(f"Discord upload failed: HTTP {resp.status_code}")
+    except Exception as exc:
+        on_failure(f"Discord upload error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Log tailer
 # ---------------------------------------------------------------------------
 
 class LogTailer:
-    def __init__(self, log_path: Path, output_dir: Path,
-                 poll_interval: float, on_event):
-        self.log_path = log_path
-        self.output_dir = output_dir
+    def __init__(self, log_path: Path, output_dir: Path, bak_dir: Path,
+                 poll_interval: float, on_event, webhook_url: str = "",
+                 on_failure=None, max_backups: int = 10):
+        self.log_path      = log_path
+        self.output_dir    = output_dir
+        self.bak_dir       = bak_dir
+        self.max_backups   = max_backups
         self.poll_interval = poll_interval
-        self.on_event = on_event          # callback(event_type, attrs)
+        self.on_event      = on_event
+        self.webhook_url   = webhook_url
+        self.on_failure    = on_failure or (lambda msg: None)
 
-        self._stop = threading.Event()
+        self._stop   = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="log-tailer")
-        # running totals for today — pre-populated from today's XML if it exists
-        self._today = datetime.now().date()
-        self.auec_today, self.blueprints_today, self.deaths_today, self.events_today = \
-            _load_daily_totals(output_dir)
-        # last-fired timestamps for cooldown-based deduplication
+        self.blueprints_session = 0          # count for this monitor run only
+        self.blueprints_total   = _load_total_blueprints(output_dir)
         self._last_fired: dict[str, float] = {}
+        self._session_end_fired = False
 
     def start(self):
         self._thread.start()
 
     def stop(self):
         self._stop.set()
+        self._on_session_end()
 
-    def _reset_daily_totals_if_needed(self):
-        today = datetime.now().date()
-        if today != self._today:
-            self._today = today
-            self.auec_today = 0
-            self.blueprints_today = 0
-            self.deaths_today = 0
-            self.events_today = 0
+    def _on_session_end(self):
+        """Upload blueprints.json to Discord if any blueprints were found this session."""
+        if self._session_end_fired or self.blueprints_session == 0:
+            return
+        self._session_end_fired = True
+        json_path = _blueprints_path(self.output_dir)
+        if not json_path.exists():
+            return
+        summary = (
+            f"\U0001f4cb Blueprint(s) received this session: {self.blueprints_session}\n"
+            f"Total blueprints on record: {self.blueprints_total}"
+        )
+        threading.Thread(
+            target=upload_to_discord,
+            args=(self.webhook_url, json_path, summary, self.on_failure),
+            daemon=True,
+            name="discord-upload",
+        ).start()
 
     def _run(self):
         fh = None
@@ -194,16 +234,15 @@ class LogTailer:
                 current_size = self.log_path.stat().st_size
 
                 if fh is None:
-                    # First open — seek to end so we only catch live events
-                    fh = open(self.log_path, "r", encoding="utf-8",
-                               errors="replace")
+                    fh = open(self.log_path, "r", encoding="utf-8", errors="replace")
                     fh.seek(0, 2)
                     last_size = current_size
                 elif current_size < last_size:
-                    # File was replaced (new game session) — reopen from end
+                    # Log replaced — new game session
+                    self._on_session_end()
+                    self._session_end_fired = False
                     fh.close()
-                    fh = open(self.log_path, "r", encoding="utf-8",
-                               errors="replace")
+                    fh = open(self.log_path, "r", encoding="utf-8", errors="replace")
                     fh.seek(0, 2)
                     last_size = current_size
 
@@ -213,7 +252,6 @@ class LogTailer:
                     self._stop.wait(self.poll_interval)
                     continue
 
-                self._reset_daily_totals_if_needed()
                 self._process_line(line)
 
             except Exception:
@@ -234,7 +272,6 @@ class LogTailer:
 
             event_type = pattern["name"]
 
-            # Cooldown check — suppress duplicate firings within N seconds
             cooldown = pattern.get("cooldown", 0)
             if cooldown:
                 now = time.monotonic()
@@ -243,82 +280,254 @@ class LogTailer:
                 self._last_fired[event_type] = now
 
             attrs = pattern["build"](m)
-            append_event(self.output_dir, event_type, attrs)
-
-            self.events_today += 1
-            if event_type == "aUEC":
-                self.auec_today += int(attrs["amount"])
-            elif event_type == "blueprint":
-                self.blueprints_today += 1
-            elif event_type in ("death_vehicle", "death_onfoot"):
-                self.deaths_today += 1
-
+            append_blueprint(self.output_dir, self.bak_dir, attrs["item"],
+                             self.max_backups)
+            self.blueprints_session += 1
+            self.blueprints_total   += 1
             self.on_event(event_type, attrs)
-            break   # one pattern per line is enough
+            break
+
+
+# ---------------------------------------------------------------------------
+# Settings dialog (tkinter)
+# ---------------------------------------------------------------------------
+
+def show_settings_dialog(on_saved):
+    """Open a settings form in a background thread."""
+    def _dialog():
+        import tkinter as tk
+        from tkinter import filedialog, messagebox
+
+        config      = load_config()
+        log_file    = config.get("paths",   "log_file",      fallback="")
+        output_dir  = config.get("paths",   "output_dir",    fallback="")
+        bak_dir     = config.get("paths",   "bak_dir",       fallback="")
+        max_backups = config.get("paths",   "max_backups",   fallback="10")
+        webhook     = config.get("discord", "webhook_url",   fallback="")
+        poll        = config.get("monitor", "poll_interval", fallback="1.0")
+
+        root = tk.Tk()
+        root.title("SC Log Monitor — Settings")
+        root.resizable(False, False)
+        root.attributes("-topmost", True)
+
+        pad = {"padx": 8, "pady": 4}
+
+        # Game log file
+        tk.Label(root, text="Game log file:", anchor="w").grid(
+            row=0, column=0, sticky="w", **pad)
+        log_var = tk.StringVar(value=log_file)
+        tk.Entry(root, textvariable=log_var, width=55).grid(row=0, column=1, **pad)
+        def browse_log():
+            p = filedialog.askopenfilename(
+                title="Select Game.log",
+                filetypes=[("Log files", "*.log"), ("All files", "*.*")],
+            )
+            if p:
+                log_var.set(p)
+        tk.Button(root, text="Browse…", command=browse_log).grid(row=0, column=2, **pad)
+
+        # Output directory
+        tk.Label(root, text="Output directory:", anchor="w").grid(
+            row=1, column=0, sticky="w", **pad)
+        dir_var = tk.StringVar(value=output_dir)
+        tk.Entry(root, textvariable=dir_var, width=55).grid(row=1, column=1, **pad)
+        def browse_dir():
+            p = filedialog.askdirectory(title="Select output directory")
+            if p:
+                dir_var.set(p)
+        tk.Button(root, text="Browse…", command=browse_dir).grid(row=1, column=2, **pad)
+
+        # Backup directory
+        tk.Label(root, text="Backup directory:", anchor="w").grid(
+            row=2, column=0, sticky="w", **pad)
+        bak_var = tk.StringVar(value=bak_dir)
+        tk.Entry(root, textvariable=bak_var, width=55).grid(row=2, column=1, **pad)
+        def browse_bak():
+            p = filedialog.askdirectory(title="Select backup directory")
+            if p:
+                bak_var.set(p)
+        tk.Button(root, text="Browse…", command=browse_bak).grid(row=2, column=2, **pad)
+
+        # Discord webhook URL
+        tk.Label(root, text="Discord webhook URL:", anchor="w").grid(
+            row=3, column=0, sticky="w", **pad)
+        hook_var = tk.StringVar(value=webhook)
+        tk.Entry(root, textvariable=hook_var, width=55).grid(
+            row=3, column=1, columnspan=2, sticky="we", **pad)
+
+        # Poll interval
+        tk.Label(root, text="Poll interval (seconds):", anchor="w").grid(
+            row=4, column=0, sticky="w", **pad)
+        poll_var = tk.StringVar(value=poll)
+        tk.Entry(root, textvariable=poll_var, width=10).grid(
+            row=4, column=1, sticky="w", **pad)
+
+        # Max backups
+        tk.Label(root, text="Max backups to keep:", anchor="w").grid(
+            row=5, column=0, sticky="w", **pad)
+        bak_count_var = tk.StringVar(value=max_backups)
+        tk.Entry(root, textvariable=bak_count_var, width=10).grid(
+            row=5, column=1, sticky="w", **pad)
+
+        # Buttons
+        btn_frame = tk.Frame(root)
+        btn_frame.grid(row=6, column=0, columnspan=3, pady=8)
+
+        def on_save():
+            try:
+                float(poll_var.get())
+            except ValueError:
+                messagebox.showerror("Invalid value", "Poll interval must be a number.")
+                return
+            try:
+                int(bak_count_var.get())
+            except ValueError:
+                messagebox.showerror("Invalid value", "Max backups must be a whole number.")
+                return
+            save_config(
+                log_var.get().strip(),
+                dir_var.get().strip(),
+                bak_var.get().strip(),
+                hook_var.get().strip(),
+                poll_var.get().strip(),
+                bak_count_var.get().strip(),
+            )
+            root.destroy()
+            on_saved()
+
+        tk.Button(btn_frame, text="Save",   width=10, command=on_save).pack(side="left", padx=4)
+        tk.Button(btn_frame, text="Cancel", width=10, command=root.destroy).pack(side="left", padx=4)
+
+        root.mainloop()
+
+    threading.Thread(target=_dialog, daemon=True, name="settings-dialog").start()
+
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+def _show_message(title: str, message: str) -> None:
+    """Show a message dialog in a background thread (always visible on Windows 11)."""
+    def _run():
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        messagebox.showinfo(title, message, parent=root)
+        root.destroy()
+    threading.Thread(target=_run, daemon=True, name="notify-dialog").start()
 
 
 # ---------------------------------------------------------------------------
 # System tray
 # ---------------------------------------------------------------------------
 
+_ICON_PATH = Path(__file__).parent / "src" / "bot-avatar.png"
+
+
 def _make_icon() -> Image.Image:
-    """Draw a simple 64×64 icon: dark-green circle with 'SC' text."""
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse([2, 2, size - 2, size - 2], fill="#1a6b3c")
-    # Use default bitmap font (always available, no file needed)
     try:
-        font = ImageFont.truetype("arialbd.ttf", 22)
+        return Image.open(_ICON_PATH).convert("RGBA").resize((64, 64), Image.LANCZOS)
     except Exception:
-        font = ImageFont.load_default()
-    draw.text((size // 2, size // 2), "SC", font=font, fill="white",
-              anchor="mm")
-    return img
+        size = 64
+        img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.ellipse([2, 2, size - 2, size - 2], fill="#1a6b3c")
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 22)
+        except Exception:
+            font = ImageFont.load_default()
+        draw.text((size // 2, size // 2), "SC", font=font, fill="white", anchor="mm")
+        return img
 
 
-def run_tray(tailer: LogTailer, output_dir: Path):
+def run_tray(tailer_ref: list, output_dir_ref: list, on_event_fn):
     def tooltip() -> str:
+        t = tailer_ref[0]
         return (
             f"SC Log Monitor\n"
-            f"Today: {tailer.auec_today:,} aUEC  |  "
-            f"{tailer.blueprints_today} blueprint(s)  |  "
-            f"{tailer.deaths_today} death(s)  |  "
-            f"{tailer.events_today} event(s)"
+            f"Session: {t.blueprints_session} blueprint(s)"
         )
 
     def on_open_folder(icon, item):
-        os.startfile(str(output_dir))
+        os.startfile(str(output_dir_ref[0]))
 
     def on_stats(icon, item):
         icon.title = tooltip()
 
+    def on_upload_now(icon, item):
+        t = tailer_ref[0]
+        json_path = _blueprints_path(t.output_dir)
+        if not json_path.exists():
+            _show_message("SC Log Monitor", "No blueprints file found — nothing to upload.")
+            return
+        total = _load_total_blueprints(t.output_dir)
+        summary = (
+            f"\U0001f4cb Manual upload\n"
+            f"Total blueprints on record: {total}"
+        )
+        threading.Thread(
+            target=upload_to_discord,
+            args=(t.webhook_url, json_path, summary, on_upload_failure),
+            daemon=True,
+            name="discord-upload-manual",
+        ).start()
+
     def on_quit(icon, item):
-        tailer.stop()
+        tailer_ref[0].stop()
         icon.stop()
+
+    def on_upload_failure(message: str):
+        _show_message("SC Log Monitor — Upload Failed", message)
+
+    tailer_ref[0].on_failure = on_upload_failure
+
+    def on_settings(icon, item):
+        def restart_tailer():
+            tailer_ref[0].stop()
+            config     = load_config()
+            log_path   = Path(config.get("paths",   "log_file"))
+            output_dir = Path(config.get("paths",   "output_dir"))
+            bak_dir     = Path(config.get("paths",   "bak_dir",
+                                          fallback=str(_default_bak_dir())))
+            max_backups = config.getint("paths",    "max_backups",   fallback=10)
+            poll_sec    = config.getfloat("monitor", "poll_interval", fallback=1.0)
+            webhook     = config.get("discord", "webhook_url", fallback="")
+            output_dir_ref[0] = output_dir
+            new_tailer = LogTailer(log_path, output_dir, bak_dir, poll_sec,
+                                   on_event_fn, webhook, on_upload_failure,
+                                   max_backups)
+            tailer_ref[0] = new_tailer
+            new_tailer.start()
+            icon.title = tooltip()
+
+        show_settings_dialog(on_saved=restart_tailer)
 
     icon = pystray.Icon(
         name="sc-log-monitor",
         icon=_make_icon(),
         title=tooltip(),
         menu=pystray.Menu(
-            pystray.MenuItem("Refresh stats", on_stats),
-            pystray.MenuItem("Open output folder", on_open_folder),
+            pystray.MenuItem("Refresh stats",          on_stats),
+            pystray.MenuItem("Upload to Discord now",  on_upload_now),
+            pystray.MenuItem("Settings",               on_settings),
+            pystray.MenuItem("Open output folder",     on_open_folder),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", on_quit),
         ),
     )
 
-    # Keep the tooltip fresh every 30 s without blocking the tray thread
     def _refresh_loop():
-        while not tailer._stop.is_set():
+        while not tailer_ref[0]._stop.is_set():
             icon.title = tooltip()
             time.sleep(30)
 
-    threading.Thread(target=_refresh_loop, daemon=True,
-                     name="tooltip-refresh").start()
+    threading.Thread(target=_refresh_loop, daemon=True, name="tooltip-refresh").start()
 
-    icon.run()   # blocks until Quit is selected
+    icon.run()
 
 
 # ---------------------------------------------------------------------------
@@ -326,35 +535,41 @@ def run_tray(tailer: LogTailer, output_dir: Path):
 # ---------------------------------------------------------------------------
 
 def main():
-    config = load_config()
-
+    config     = load_config()
     log_path   = Path(config.get("paths", "log_file"))
-    output_dir = Path(config.get("paths", "output_dir"))
-    poll_sec   = config.getfloat("monitor", "poll_interval", fallback=1.0)
+    output_dir = Path(config.get("paths", "output_dir",
+                                  fallback=str(_default_output_dir())))
+    bak_dir    = Path(config.get("paths", "bak_dir",
+                                  fallback=str(_default_bak_dir())))
+    max_backups = config.getint("paths",    "max_backups",   fallback=10)
+    poll_sec    = config.getfloat("monitor", "poll_interval", fallback=1.0)
+    webhook     = config.get("discord", "webhook_url", fallback="")
+
+    # Persist defaults to config.ini on first run so Settings dialog is pre-filled
+    if not config.has_option("paths", "output_dir") or not config.has_option("paths", "bak_dir"):
+        save_config(
+            str(log_path), str(output_dir), str(bak_dir),
+            webhook, str(poll_sec), str(max_backups),
+        )
 
     def on_event(event_type: str, attrs: dict):
-        # Console feedback when not running as a pure background process
         ts = datetime.now().strftime("%H:%M:%S")
-        if event_type == "aUEC":
-            print(f"[{ts}] aUEC awarded: {int(attrs['amount']):,}")
-        elif event_type == "blueprint":
+        if event_type == "blueprint":
             print(f"[{ts}] Blueprint received: {attrs['item']}")
-        elif event_type == "death_vehicle":
-            print(f"[{ts}] Vehicle death: {attrs['ship']} hit {attrs['hit_entity']} in {attrs['zone']}")
-        elif event_type == "death_onfoot":
-            print(f"[{ts}] On-foot death")
         else:
             print(f"[{ts}] {event_type}: {attrs}")
 
-    tailer = LogTailer(log_path, output_dir, poll_sec, on_event)
+    tailer = LogTailer(log_path, output_dir, bak_dir, poll_sec, on_event,
+                       webhook, max_backups=max_backups)
     tailer.start()
 
-    print(f"SC Log Monitor started.")
+    print("SC Log Monitor started.")
     print(f"  Watching : {log_path}")
     print(f"  Output   : {output_dir}")
+    print(f"  Backups  : {bak_dir}")
     print(f"  Tray icon active — right-click it to open folder or quit.")
 
-    run_tray(tailer, output_dir)
+    run_tray([tailer], [output_dir], on_event)
 
 
 if __name__ == "__main__":

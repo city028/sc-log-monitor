@@ -1,0 +1,11 @@
+[paths]
+log_file = C:\Program Files\Roberts Space Industries\StarCitizen\LIVE\Game.log
+output_dir = C:\Users\<YourName>\Documents\Blueprints
+bak_dir = C:\Users\<YourName>\Documents\Blueprints\bak
+max_backups = 10
+
+[monitor]
+poll_interval = 1.0
+
+[discord]
+webhook_url =

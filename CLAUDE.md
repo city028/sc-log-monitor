@@ -42,7 +42,13 @@ vault-push
 
 
 ## Stack
-<!-- Languages, frameworks, key dependencies -->
+- Python 3.11+
+- `pystray` 0.19.5 — system tray icon and menu
+- `Pillow` 12.2.0 — tray icon image loading/rendering
+- `requests` ≥2.31.0 — Discord webhook HTTP POST
+- `tkinter` (stdlib) — Settings dialog and notifications
+- `configparser` (stdlib) — config.ini read/write
+- Storage: JSON (flat list), one persistent file per user
 
 ---
 
@@ -62,7 +68,11 @@ vault-push
 ---
 
 ## Key Files
-<!-- List important files and their purpose -->
+- `sc_log_monitor.py` — all application logic (single file)
+- `config.ini` — runtime configuration (paths, webhook, poll interval, max backups)
+- `launch.vbs` — silent launcher (no console window)
+- `src/bot-avatar.png` — tray icon
+- `requirements.txt` — pip dependencies
 
 ---
 
@@ -72,7 +82,9 @@ vault-push
 ---
 
 ## TODO
-<!-- Running list of tasks — keep this in sync with TODO.md if present -->
+- Package with PyInstaller as standalone `.exe` for distribution
+- Harden first-run: validate `log_file` path, show setup guidance if missing
+- Further testing of `death_onfoot` pattern to distinguish ALT-F4 from real deaths
 
 ---
 

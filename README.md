@@ -10,8 +10,9 @@ A lightweight Windows system-tray app that watches the Star Citizen `Game.log` i
 - Appends each blueprint to a single persistent `blueprints.json` file (local backup)
 - Backs up `blueprints.json` before every write (configurable max backups)
 - Sends each blueprint immediately as a structured Discord embed via webhook
-- Per-user identity via a one-time `/linkapp` token handshake (no shared webhook attribution)
-- System tray icon with live session count and right-click menu
+- Per-user identity via a one-time `/blueprint-link` token handshake — no manual User ID lookup needed
+- Uploads are blocked until the account is linked, with clear error messages guiding the user
+- System tray icon with live session count and link status
 - All settings configurable via an in-app Settings dialog — no manual file editing
 
 ---
@@ -44,7 +45,7 @@ requests>=2.31.0
 
 ## Configuration
 
-All settings are stored in `config.ini` and editable via the Settings dialog:
+All settings are stored in `config.ini` and editable via the Settings dialog.
 
 ### General tab
 
@@ -58,26 +59,28 @@ All settings are stored in `config.ini` and editable via the Settings dialog:
 
 ### Discord tab
 
-| Setting | Description |
-|---------|-------------|
-| Webhook URL | Channel webhook URL (provided by your server admin) |
-| Bot API URL | Base URL of the bot's link-status endpoint (provided by your server admin) |
-| Link Token | One-time token from `/linkapp` in Discord — enter and click **Link Account** to pair |
-| Discord User ID | Populated automatically after successful link |
-| Guild Token | Populated automatically after successful link — identifies you to the bot |
+| Setting | Source | Description |
+|---------|--------|-------------|
+| Webhook URL | Guild admin | Channel webhook URL for posting blueprint embeds |
+| Guild Token | Guild admin | Per-guild security token included in every embed |
+| Link Token | `/blueprint-link` command | One-time token — enter and click **Link Account** to pair |
+| Discord User ID | Auto-populated | Your Discord snowflake ID, resolved during the link handshake |
 
-> **Security note:** Webhook URLs and bot API URLs should be provided by your server administrator during setup. Do not share them publicly.
+> **Security note:** Webhook URL and Guild Token are provided by your server administrator. Do not share them publicly.
 
 ---
 
 ## First-time Discord setup
 
-1. In your Discord server run `/linkapp` — the bot responds with a one-time token
+1. Obtain the **Webhook URL** and **Guild Token** from your server administrator
 2. Open tray → **Settings** → **Discord** tab
-3. Fill in **Webhook URL** and **Bot API URL** (provided by your admin)
-4. Paste the token into **Link Token** and click **Link Account**
-5. Wait up to 60 seconds — **Discord User ID** and **Guild Token** will populate when the bot confirms
-6. Click **Save** — the app is now paired and will send embeds under your Discord identity
+3. Fill in Webhook URL and Guild Token
+4. In your Discord server run `/blueprint-link` — the bot responds with a one-time token
+5. Paste the token into **Link Token** and click **Link Account**
+6. Within ~60 seconds **Discord User ID** will populate automatically
+7. Click **Save** — the app is now paired and ready to send blueprint embeds
+
+> If you need to re-pair (e.g. moving to a new guild), click **Reset Discord Settings** (red button) to clear all credentials, then repeat from step 1.
 
 ---
 
@@ -104,8 +107,8 @@ A flat list — one entry per blueprint, ordered by detection time. Grows indefi
 
 | Item | Action |
 |------|--------|
-| Refresh stats | Updates the tooltip with the current session count and link status |
-| Upload to Discord now | Resends all local blueprints.json entries as individual Discord embeds |
+| Refresh stats | Updates the tooltip with current session count and link status |
+| Upload to Discord now | Resends all `blueprints.json` entries as individual Discord embeds |
 | Settings | Opens the settings dialog (General + Discord tabs) |
 | Open output folder | Opens the output directory in Explorer |
 | Quit | Exits the app |
@@ -118,4 +121,16 @@ A flat list — one entry per blueprint, ordered by detection time. Grows indefi
 - The embed contains your Discord User ID and Guild Token so the bot can attribute and validate the entry
 - The bot processes the embed and deletes the message from the channel
 - A local copy is always written to `blueprints.json` first — embeds can be resent any time via **Upload to Discord now**
+- **Uploads are blocked** if Webhook URL, Guild Token, or Discord User ID are not configured — a single actionable error dialog is shown
 - On upload failure a dialog is shown with the error; local data is never lost
+
+---
+
+## Link handshake — how it works
+
+The app and bot communicate entirely through Discord's webhook REST API — no separate server required:
+
+1. App POSTs a link-request embed (footer = link token) to the webhook with `?wait=true`, receiving the `message_id`
+2. Bot sees the message via the Discord gateway, matches the token to the user who ran `/blueprint-link`, and edits the message title to `"Application Link SUCCESS"` with the User ID in a field
+3. App polls `GET /webhooks/{id}/{token}/messages/{message_id}` every 2 seconds until the title matches, reads the User ID, then deletes the message
+4. User ID is saved to `config.ini` — no further linking needed unless resetting

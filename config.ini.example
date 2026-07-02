@@ -9,3 +9,6 @@ poll_interval = 1.0
 
 [discord]
 webhook_url =
+bot_api_url =
+user_id =
+guild_token =

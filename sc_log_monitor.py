@@ -1,7 +1,7 @@
 """
 SC Log Monitor — real-time Star Citizen log watcher.
-Detects blueprint drops, appends them to a persistent blueprints.json,
-and uploads the file to Discord at end of session.
+Detects blueprint drops, appends them to a persistent local blueprints.json,
+and sends a structured Discord embed via webhook for bot processing.
 """
 
 import os
@@ -30,7 +30,7 @@ def _get_documents_dir() -> Path:
     try:
         import ctypes, ctypes.wintypes
         buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
-        ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf)  # CSIDL_PERSONAL
+        ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf)
         return Path(buf.value)
     except Exception:
         return Path.home() / "Documents"
@@ -51,7 +51,9 @@ def load_config() -> configparser.ConfigParser:
 
 
 def save_config(log_file: str, output_dir: str, bak_dir: str,
-                webhook_url: str, poll_interval: str, max_backups: str) -> None:
+                max_backups: str, poll_interval: str,
+                webhook_url: str, bot_api_url: str,
+                user_id: str, guild_token: str) -> None:
     """Write all settings back to config.ini."""
     config = configparser.ConfigParser()
     config.read(CONFIG_FILE, encoding="utf-8")
@@ -70,6 +72,9 @@ def save_config(log_file: str, output_dir: str, bak_dir: str,
     if not config.has_section("discord"):
         config.add_section("discord")
     config.set("discord", "webhook_url", webhook_url)
+    config.set("discord", "bot_api_url", bot_api_url)
+    config.set("discord", "user_id",     user_id)
+    config.set("discord", "guild_token", guild_token)
 
     with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
         config.write(fh)
@@ -89,7 +94,7 @@ PATTERNS = [
 
 
 # ---------------------------------------------------------------------------
-# Persistent JSON store — single blueprints.json that grows over time
+# Persistent local JSON store
 # ---------------------------------------------------------------------------
 
 _file_lock = threading.Lock()
@@ -100,13 +105,13 @@ def _blueprints_path(output_dir: Path) -> Path:
 
 
 def append_blueprint(output_dir: Path, bak_dir: Path, item: str,
-                     max_backups: int = 10) -> None:
-    """Backup blueprints.json then append the new entry."""
+                     max_backups: int = 10) -> str:
+    """Backup blueprints.json, append the new entry, return UTC timestamp string."""
     output_dir.mkdir(parents=True, exist_ok=True)
     path = _blueprints_path(output_dir)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     with _file_lock:
-        # Backup before every write, keeping only max_backups most recent
         if path.exists():
             bak_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -114,24 +119,20 @@ def append_blueprint(output_dir: Path, bak_dir: Path, item: str,
             existing = sorted(bak_dir.glob("blueprints_*.json"))
             for old in existing[:-max_backups]:
                 old.unlink(missing_ok=True)
-
-        if path.exists():
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
         else:
             data = []
 
-        data.append({
-            "item":      item,
-            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        })
+        data.append({"item": item, "timestamp": timestamp})
 
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2)
 
+    return timestamp
+
 
 def _load_total_blueprints(output_dir: Path) -> int:
-    """Return the total number of blueprints recorded across all sessions."""
     path = _blueprints_path(output_dir)
     if not path.exists():
         return 0
@@ -142,28 +143,131 @@ def _load_total_blueprints(output_dir: Path) -> int:
         return 0
 
 
+def _load_all_blueprints(output_dir: Path) -> list:
+    path = _blueprints_path(output_dir)
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return []
+
+
 # ---------------------------------------------------------------------------
-# Discord upload
+# Notifications
 # ---------------------------------------------------------------------------
 
-def upload_to_discord(webhook_url: str, json_path: Path, summary: str,
-                      on_failure) -> None:
-    """POST json_path to a Discord webhook with a summary message."""
+def _show_message(title: str, message: str) -> None:
+    """Show a message dialog in a background thread."""
+    def _run():
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        messagebox.showinfo(title, message, parent=root)
+        root.destroy()
+    threading.Thread(target=_run, daemon=True, name="notify-dialog").start()
+
+
+# ---------------------------------------------------------------------------
+# Discord embed upload
+# ---------------------------------------------------------------------------
+
+def post_blueprint_embed(webhook_url: str, user_id: str, guild_token: str,
+                         item: str, timestamp: str, on_failure) -> None:
+    """POST a single blueprint as a Discord embed via webhook.
+
+    Runs in the calling thread — callers should spawn a daemon thread.
+    """
     if not webhook_url:
         on_failure("Discord webhook URL is not configured.")
         return
+    if not user_id or not guild_token:
+        on_failure("Discord account not linked. Use Settings → Discord → Link Account.")
+        return
     try:
-        with open(json_path, "rb") as fh:
-            resp = requests.post(
-                webhook_url,
-                files={"file": (json_path.name, fh, "application/json")},
-                data={"content": summary},
-                timeout=15,
-            )
+        payload = {
+            "embeds": [{
+                "title":  "\U0001f535 Star Citizen Blueprint Sync",
+                "color":  242424,
+                "fields": [
+                    {"name": "User_ID",        "value": user_id, "inline": True},
+                    {"name": "Blueprint_Name", "value": item,    "inline": True},
+                ],
+                "footer":    {"text": guild_token},
+                "timestamp": timestamp,
+            }]
+        }
+        resp = requests.post(webhook_url, json=payload, timeout=15)
         if not resp.ok:
             on_failure(f"Discord upload failed: HTTP {resp.status_code}")
     except Exception as exc:
         on_failure(f"Discord upload error: {exc}")
+
+
+def resend_all_from_local(webhook_url: str, user_id: str, guild_token: str,
+                          output_dir: Path, on_failure) -> None:
+    """Re-send every entry in blueprints.json as individual embeds."""
+    entries = _load_all_blueprints(output_dir)
+    if not entries:
+        _show_message("SC Log Monitor", "No local blueprints found — nothing to resend.")
+        return
+    for entry in entries:
+        post_blueprint_embed(webhook_url, user_id, guild_token,
+                             entry["item"], entry["timestamp"], on_failure)
+        time.sleep(0.5)   # avoid hitting Discord rate limits
+
+
+# ---------------------------------------------------------------------------
+# Link account handshake
+# ---------------------------------------------------------------------------
+
+def link_account(webhook_url: str, bot_api_url: str, link_token: str,
+                 on_success, on_failure) -> None:
+    """One-time pairing flow: POST link token via webhook, poll bot API for response.
+
+    on_success(user_id, guild_token) — called when pairing confirmed.
+    on_failure(message)              — called on timeout or error.
+    Runs in the calling thread — callers should spawn a daemon thread.
+    """
+    if not webhook_url or not bot_api_url or not link_token:
+        on_failure("Webhook URL, Bot API URL, and Link Token are all required.")
+        return
+
+    # 1. Send the init payload to the webhook
+    try:
+        init_payload = {
+            "content": "__LINK__",
+            "embeds": [{"footer": {"text": link_token.strip()}}],
+        }
+        resp = requests.post(webhook_url, json=init_payload, timeout=15)
+        if not resp.ok:
+            on_failure(f"Link init failed: HTTP {resp.status_code}")
+            return
+    except Exception as exc:
+        on_failure(f"Link init error: {exc}")
+        return
+
+    # 2. Poll the bot API for confirmation (up to 60 s)
+    poll_url = f"{bot_api_url.rstrip('/')}/link-status/{link_token.strip()}"
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        try:
+            r = requests.get(poll_url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                on_success(data["user_id"], data["guild_token"])
+                return
+            elif r.status_code != 404:
+                on_failure(f"Bot API error: HTTP {r.status_code}")
+                return
+        except Exception:
+            pass  # transient error — keep polling
+
+    on_failure("Link timed out after 60 seconds. Try /linkapp again in Discord.")
 
 
 # ---------------------------------------------------------------------------
@@ -172,50 +276,30 @@ def upload_to_discord(webhook_url: str, json_path: Path, summary: str,
 
 class LogTailer:
     def __init__(self, log_path: Path, output_dir: Path, bak_dir: Path,
-                 poll_interval: float, on_event, webhook_url: str = "",
+                 poll_interval: float, on_event,
+                 webhook_url: str = "", user_id: str = "", guild_token: str = "",
                  on_failure=None, max_backups: int = 10):
         self.log_path      = log_path
         self.output_dir    = output_dir
         self.bak_dir       = bak_dir
-        self.max_backups   = max_backups
         self.poll_interval = poll_interval
         self.on_event      = on_event
         self.webhook_url   = webhook_url
+        self.user_id       = user_id
+        self.guild_token   = guild_token
         self.on_failure    = on_failure or (lambda msg: None)
+        self.max_backups   = max_backups
 
         self._stop   = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="log-tailer")
-        self.blueprints_session = 0          # count for this monitor run only
-        self.blueprints_total   = _load_total_blueprints(output_dir)
+        self._thread = threading.Thread(target=self._run, daemon=True, name="log-tailer")
+        self.blueprints_session = 0
         self._last_fired: dict[str, float] = {}
-        self._session_end_fired = False
 
     def start(self):
         self._thread.start()
 
     def stop(self):
         self._stop.set()
-        self._on_session_end()
-
-    def _on_session_end(self):
-        """Upload blueprints.json to Discord if any blueprints were found this session."""
-        if self._session_end_fired or self.blueprints_session == 0:
-            return
-        self._session_end_fired = True
-        json_path = _blueprints_path(self.output_dir)
-        if not json_path.exists():
-            return
-        summary = (
-            f"\U0001f4cb Blueprint(s) received this session: {self.blueprints_session}\n"
-            f"Total blueprints on record: {self.blueprints_total}"
-        )
-        threading.Thread(
-            target=upload_to_discord,
-            args=(self.webhook_url, json_path, summary, self.on_failure),
-            daemon=True,
-            name="discord-upload",
-        ).start()
 
     def _run(self):
         fh = None
@@ -238,9 +322,6 @@ class LogTailer:
                     fh.seek(0, 2)
                     last_size = current_size
                 elif current_size < last_size:
-                    # Log replaced — new game session
-                    self._on_session_end()
-                    self._session_end_fired = False
                     fh.close()
                     fh = open(self.log_path, "r", encoding="utf-8", errors="replace")
                     fh.seek(0, 2)
@@ -280,99 +361,177 @@ class LogTailer:
                 self._last_fired[event_type] = now
 
             attrs = pattern["build"](m)
-            append_blueprint(self.output_dir, self.bak_dir, attrs["item"],
-                             self.max_backups)
+            timestamp = append_blueprint(self.output_dir, self.bak_dir,
+                                         attrs["item"], self.max_backups)
             self.blueprints_session += 1
-            self.blueprints_total   += 1
+
+            threading.Thread(
+                target=post_blueprint_embed,
+                args=(self.webhook_url, self.user_id, self.guild_token,
+                      attrs["item"], timestamp, self.on_failure),
+                daemon=True,
+                name="discord-embed",
+            ).start()
+
             self.on_event(event_type, attrs)
             break
 
 
 # ---------------------------------------------------------------------------
-# Settings dialog (tkinter)
+# Settings dialog (tabbed tkinter)
 # ---------------------------------------------------------------------------
 
 def show_settings_dialog(on_saved):
-    """Open a settings form in a background thread."""
+    """Open a tabbed settings form in a background thread."""
     def _dialog():
         import tkinter as tk
-        from tkinter import filedialog, messagebox
+        from tkinter import ttk, filedialog, messagebox
 
         config      = load_config()
         log_file    = config.get("paths",   "log_file",      fallback="")
         output_dir  = config.get("paths",   "output_dir",    fallback="")
         bak_dir     = config.get("paths",   "bak_dir",       fallback="")
         max_backups = config.get("paths",   "max_backups",   fallback="10")
-        webhook     = config.get("discord", "webhook_url",   fallback="")
         poll        = config.get("monitor", "poll_interval", fallback="1.0")
+        webhook     = config.get("discord", "webhook_url",   fallback="")
+        bot_api     = config.get("discord", "bot_api_url",   fallback="")
+        user_id     = config.get("discord", "user_id",       fallback="")
+        guild_token = config.get("discord", "guild_token",   fallback="")
 
         root = tk.Tk()
         root.title("SC Log Monitor — Settings")
         root.resizable(False, False)
         root.attributes("-topmost", True)
 
+        nb  = ttk.Notebook(root)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tab_gen  = ttk.Frame(nb)
+        tab_disc = ttk.Frame(nb)
+        nb.add(tab_gen,  text="General")
+        nb.add(tab_disc, text="Discord")
+
         pad = {"padx": 8, "pady": 4}
 
-        # Game log file
-        tk.Label(root, text="Game log file:", anchor="w").grid(
+        # ── General tab ───────────────────────────────────────────────────
+        tk.Label(tab_gen, text="Game log file:", anchor="w").grid(
             row=0, column=0, sticky="w", **pad)
         log_var = tk.StringVar(value=log_file)
-        tk.Entry(root, textvariable=log_var, width=55).grid(row=0, column=1, **pad)
+        tk.Entry(tab_gen, textvariable=log_var, width=50).grid(row=0, column=1, **pad)
         def browse_log():
             p = filedialog.askopenfilename(
                 title="Select Game.log",
-                filetypes=[("Log files", "*.log"), ("All files", "*.*")],
-            )
-            if p:
-                log_var.set(p)
-        tk.Button(root, text="Browse…", command=browse_log).grid(row=0, column=2, **pad)
+                filetypes=[("Log files", "*.log"), ("All files", "*.*")])
+            if p: log_var.set(p)
+        tk.Button(tab_gen, text="Browse…", command=browse_log).grid(row=0, column=2, **pad)
 
-        # Output directory
-        tk.Label(root, text="Output directory:", anchor="w").grid(
+        tk.Label(tab_gen, text="Output directory:", anchor="w").grid(
             row=1, column=0, sticky="w", **pad)
         dir_var = tk.StringVar(value=output_dir)
-        tk.Entry(root, textvariable=dir_var, width=55).grid(row=1, column=1, **pad)
+        tk.Entry(tab_gen, textvariable=dir_var, width=50).grid(row=1, column=1, **pad)
         def browse_dir():
             p = filedialog.askdirectory(title="Select output directory")
-            if p:
-                dir_var.set(p)
-        tk.Button(root, text="Browse…", command=browse_dir).grid(row=1, column=2, **pad)
+            if p: dir_var.set(p)
+        tk.Button(tab_gen, text="Browse…", command=browse_dir).grid(row=1, column=2, **pad)
 
-        # Backup directory
-        tk.Label(root, text="Backup directory:", anchor="w").grid(
+        tk.Label(tab_gen, text="Backup directory:", anchor="w").grid(
             row=2, column=0, sticky="w", **pad)
         bak_var = tk.StringVar(value=bak_dir)
-        tk.Entry(root, textvariable=bak_var, width=55).grid(row=2, column=1, **pad)
+        tk.Entry(tab_gen, textvariable=bak_var, width=50).grid(row=2, column=1, **pad)
         def browse_bak():
             p = filedialog.askdirectory(title="Select backup directory")
-            if p:
-                bak_var.set(p)
-        tk.Button(root, text="Browse…", command=browse_bak).grid(row=2, column=2, **pad)
+            if p: bak_var.set(p)
+        tk.Button(tab_gen, text="Browse…", command=browse_bak).grid(row=2, column=2, **pad)
 
-        # Discord webhook URL
-        tk.Label(root, text="Discord webhook URL:", anchor="w").grid(
+        tk.Label(tab_gen, text="Max backups to keep:", anchor="w").grid(
             row=3, column=0, sticky="w", **pad)
-        hook_var = tk.StringVar(value=webhook)
-        tk.Entry(root, textvariable=hook_var, width=55).grid(
-            row=3, column=1, columnspan=2, sticky="we", **pad)
+        bak_count_var = tk.StringVar(value=max_backups)
+        tk.Entry(tab_gen, textvariable=bak_count_var, width=10).grid(
+            row=3, column=1, sticky="w", **pad)
 
-        # Poll interval
-        tk.Label(root, text="Poll interval (seconds):", anchor="w").grid(
+        tk.Label(tab_gen, text="Poll interval (seconds):", anchor="w").grid(
             row=4, column=0, sticky="w", **pad)
         poll_var = tk.StringVar(value=poll)
-        tk.Entry(root, textvariable=poll_var, width=10).grid(
+        tk.Entry(tab_gen, textvariable=poll_var, width=10).grid(
             row=4, column=1, sticky="w", **pad)
 
-        # Max backups
-        tk.Label(root, text="Max backups to keep:", anchor="w").grid(
+        # ── Discord tab ───────────────────────────────────────────────────
+        tk.Label(tab_disc, text="Webhook URL:", anchor="w").grid(
+            row=0, column=0, sticky="w", **pad)
+        hook_var = tk.StringVar(value=webhook)
+        tk.Entry(tab_disc, textvariable=hook_var, width=55).grid(
+            row=0, column=1, columnspan=2, sticky="we", **pad)
+
+        tk.Label(tab_disc, text="Bot API URL:", anchor="w").grid(
+            row=1, column=0, sticky="w", **pad)
+        api_var = tk.StringVar(value=bot_api)
+        tk.Entry(tab_disc, textvariable=api_var, width=55).grid(
+            row=1, column=1, columnspan=2, sticky="we", **pad)
+
+        ttk.Separator(tab_disc, orient="horizontal").grid(
+            row=2, column=0, columnspan=3, sticky="we", pady=6)
+        tk.Label(tab_disc, text="Link Account", font=("", 9, "bold")).grid(
+            row=3, column=0, columnspan=3, sticky="w", padx=8)
+        tk.Label(tab_disc,
+                 text="Run /linkapp in Discord, paste the token below, then click Link Account.",
+                 anchor="w", foreground="grey").grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=8)
+
+        tk.Label(tab_disc, text="Link Token:", anchor="w").grid(
             row=5, column=0, sticky="w", **pad)
-        bak_count_var = tk.StringVar(value=max_backups)
-        tk.Entry(root, textvariable=bak_count_var, width=10).grid(
+        token_var = tk.StringVar()
+        tk.Entry(tab_disc, textvariable=token_var, width=20).grid(
             row=5, column=1, sticky="w", **pad)
 
-        # Buttons
+        link_status = tk.StringVar(value="")
+        tk.Label(tab_disc, textvariable=link_status, foreground="grey").grid(
+            row=5, column=2, sticky="w", **pad)
+
+        ttk.Separator(tab_disc, orient="horizontal").grid(
+            row=6, column=0, columnspan=3, sticky="we", pady=6)
+
+        tk.Label(tab_disc, text="Discord User ID:", anchor="w").grid(
+            row=7, column=0, sticky="w", **pad)
+        uid_var = tk.StringVar(value=user_id)
+        tk.Entry(tab_disc, textvariable=uid_var, width=30, state="readonly").grid(
+            row=7, column=1, sticky="w", **pad)
+
+        tk.Label(tab_disc, text="Guild Token:", anchor="w").grid(
+            row=8, column=0, sticky="w", **pad)
+        gt_var = tk.StringVar(value=guild_token)
+        tk.Entry(tab_disc, textvariable=gt_var, width=30, state="readonly").grid(
+            row=8, column=1, sticky="w", **pad)
+
+        def do_link():
+            link_status.set("Linking…")
+            def on_success(uid, gt):
+                uid_var.set(uid)
+                gt_var.set(gt)
+                token_var.set("")
+                link_status.set("Linked!")
+                # Persist immediately
+                save_config(
+                    log_var.get().strip(), dir_var.get().strip(),
+                    bak_var.get().strip(), bak_count_var.get().strip(),
+                    poll_var.get().strip(), hook_var.get().strip(),
+                    api_var.get().strip(), uid, gt,
+                )
+            def on_fail(msg):
+                link_status.set("Failed")
+                _show_message("Link Failed", msg)
+            threading.Thread(
+                target=link_account,
+                args=(hook_var.get().strip(), api_var.get().strip(),
+                      token_var.get().strip(), on_success, on_fail),
+                daemon=True, name="link-account",
+            ).start()
+
+        tk.Button(tab_disc, text="Link Account", command=do_link).grid(
+            row=9, column=1, sticky="w", **pad)
+
+        # ── Save / Cancel ─────────────────────────────────────────────────
         btn_frame = tk.Frame(root)
-        btn_frame.grid(row=6, column=0, columnspan=3, pady=8)
+        btn_frame.pack(pady=8)
 
         def on_save():
             try:
@@ -386,12 +545,11 @@ def show_settings_dialog(on_saved):
                 messagebox.showerror("Invalid value", "Max backups must be a whole number.")
                 return
             save_config(
-                log_var.get().strip(),
-                dir_var.get().strip(),
-                bak_var.get().strip(),
-                hook_var.get().strip(),
-                poll_var.get().strip(),
-                bak_count_var.get().strip(),
+                log_var.get().strip(), dir_var.get().strip(),
+                bak_var.get().strip(), bak_count_var.get().strip(),
+                poll_var.get().strip(), hook_var.get().strip(),
+                api_var.get().strip(), uid_var.get().strip(),
+                gt_var.get().strip(),
             )
             root.destroy()
             on_saved()
@@ -402,23 +560,6 @@ def show_settings_dialog(on_saved):
         root.mainloop()
 
     threading.Thread(target=_dialog, daemon=True, name="settings-dialog").start()
-
-
-# ---------------------------------------------------------------------------
-# Notifications
-# ---------------------------------------------------------------------------
-
-def _show_message(title: str, message: str) -> None:
-    """Show a message dialog in a background thread (always visible on Windows 11)."""
-    def _run():
-        import tkinter as tk
-        from tkinter import messagebox
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        messagebox.showinfo(title, message, parent=root)
-        root.destroy()
-    threading.Thread(target=_run, daemon=True, name="notify-dialog").start()
 
 
 # ---------------------------------------------------------------------------
@@ -447,9 +588,10 @@ def _make_icon() -> Image.Image:
 def run_tray(tailer_ref: list, output_dir_ref: list, on_event_fn):
     def tooltip() -> str:
         t = tailer_ref[0]
+        linked = "linked" if t.user_id else "not linked"
         return (
             f"SC Log Monitor\n"
-            f"Session: {t.blueprints_session} blueprint(s)"
+            f"Session: {t.blueprints_session} blueprint(s) | {linked}"
         )
 
     def on_open_folder(icon, item):
@@ -457,24 +599,6 @@ def run_tray(tailer_ref: list, output_dir_ref: list, on_event_fn):
 
     def on_stats(icon, item):
         icon.title = tooltip()
-
-    def on_upload_now(icon, item):
-        t = tailer_ref[0]
-        json_path = _blueprints_path(t.output_dir)
-        if not json_path.exists():
-            _show_message("SC Log Monitor", "No blueprints file found — nothing to upload.")
-            return
-        total = _load_total_blueprints(t.output_dir)
-        summary = (
-            f"\U0001f4cb Manual upload\n"
-            f"Total blueprints on record: {total}"
-        )
-        threading.Thread(
-            target=upload_to_discord,
-            args=(t.webhook_url, json_path, summary, on_upload_failure),
-            daemon=True,
-            name="discord-upload-manual",
-        ).start()
 
     def on_quit(icon, item):
         tailer_ref[0].stop()
@@ -485,21 +609,35 @@ def run_tray(tailer_ref: list, output_dir_ref: list, on_event_fn):
 
     tailer_ref[0].on_failure = on_upload_failure
 
+    def on_upload_now(icon, item):
+        t = tailer_ref[0]
+        threading.Thread(
+            target=resend_all_from_local,
+            args=(t.webhook_url, t.user_id, t.guild_token,
+                  t.output_dir, on_upload_failure),
+            daemon=True,
+            name="discord-resend",
+        ).start()
+
     def on_settings(icon, item):
         def restart_tailer():
             tailer_ref[0].stop()
-            config     = load_config()
-            log_path   = Path(config.get("paths",   "log_file"))
-            output_dir = Path(config.get("paths",   "output_dir"))
+            config      = load_config()
+            log_path    = Path(config.get("paths",   "log_file"))
+            output_dir  = Path(config.get("paths",   "output_dir",
+                                           fallback=str(_default_output_dir())))
             bak_dir     = Path(config.get("paths",   "bak_dir",
-                                          fallback=str(_default_bak_dir())))
+                                           fallback=str(_default_bak_dir())))
             max_backups = config.getint("paths",    "max_backups",   fallback=10)
             poll_sec    = config.getfloat("monitor", "poll_interval", fallback=1.0)
-            webhook     = config.get("discord", "webhook_url", fallback="")
+            webhook     = config.get("discord", "webhook_url",  fallback="")
+            bot_api     = config.get("discord", "bot_api_url",  fallback="")
+            user_id     = config.get("discord", "user_id",      fallback="")
+            guild_token = config.get("discord", "guild_token",  fallback="")
             output_dir_ref[0] = output_dir
             new_tailer = LogTailer(log_path, output_dir, bak_dir, poll_sec,
-                                   on_event_fn, webhook, on_upload_failure,
-                                   max_backups)
+                                   on_event_fn, webhook, user_id, guild_token,
+                                   on_upload_failure, max_backups)
             tailer_ref[0] = new_tailer
             new_tailer.start()
             icon.title = tooltip()
@@ -511,10 +649,10 @@ def run_tray(tailer_ref: list, output_dir_ref: list, on_event_fn):
         icon=_make_icon(),
         title=tooltip(),
         menu=pystray.Menu(
-            pystray.MenuItem("Refresh stats",          on_stats),
-            pystray.MenuItem("Upload to Discord now",  on_upload_now),
-            pystray.MenuItem("Settings",               on_settings),
-            pystray.MenuItem("Open output folder",     on_open_folder),
+            pystray.MenuItem("Refresh stats",         on_stats),
+            pystray.MenuItem("Upload to Discord now", on_upload_now),
+            pystray.MenuItem("Settings",              on_settings),
+            pystray.MenuItem("Open output folder",    on_open_folder),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", on_quit),
         ),
@@ -526,7 +664,6 @@ def run_tray(tailer_ref: list, output_dir_ref: list, on_event_fn):
             time.sleep(30)
 
     threading.Thread(target=_refresh_loop, daemon=True, name="tooltip-refresh").start()
-
     icon.run()
 
 
@@ -535,22 +672,23 @@ def run_tray(tailer_ref: list, output_dir_ref: list, on_event_fn):
 # ---------------------------------------------------------------------------
 
 def main():
-    config     = load_config()
-    log_path   = Path(config.get("paths", "log_file"))
-    output_dir = Path(config.get("paths", "output_dir",
-                                  fallback=str(_default_output_dir())))
-    bak_dir    = Path(config.get("paths", "bak_dir",
-                                  fallback=str(_default_bak_dir())))
+    config      = load_config()
+    log_path    = Path(config.get("paths",   "log_file"))
+    output_dir  = Path(config.get("paths",   "output_dir",
+                                   fallback=str(_default_output_dir())))
+    bak_dir     = Path(config.get("paths",   "bak_dir",
+                                   fallback=str(_default_bak_dir())))
     max_backups = config.getint("paths",    "max_backups",   fallback=10)
     poll_sec    = config.getfloat("monitor", "poll_interval", fallback=1.0)
-    webhook     = config.get("discord", "webhook_url", fallback="")
+    webhook     = config.get("discord", "webhook_url",  fallback="")
+    bot_api     = config.get("discord", "bot_api_url",  fallback="")
+    user_id     = config.get("discord", "user_id",      fallback="")
+    guild_token = config.get("discord", "guild_token",  fallback="")
 
-    # Persist defaults to config.ini on first run so Settings dialog is pre-filled
     if not config.has_option("paths", "output_dir") or not config.has_option("paths", "bak_dir"):
-        save_config(
-            str(log_path), str(output_dir), str(bak_dir),
-            webhook, str(poll_sec), str(max_backups),
-        )
+        save_config(str(log_path), str(output_dir), str(bak_dir),
+                    str(max_backups), str(poll_sec),
+                    webhook, bot_api, user_id, guild_token)
 
     def on_event(event_type: str, attrs: dict):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -559,14 +697,17 @@ def main():
         else:
             print(f"[{ts}] {event_type}: {attrs}")
 
-    tailer = LogTailer(log_path, output_dir, bak_dir, poll_sec, on_event,
-                       webhook, max_backups=max_backups)
+    tailer = LogTailer(log_path, output_dir, bak_dir, poll_sec,
+                       on_event, webhook, user_id, guild_token,
+                       max_backups=max_backups)
     tailer.start()
 
     print("SC Log Monitor started.")
     print(f"  Watching : {log_path}")
     print(f"  Output   : {output_dir}")
     print(f"  Backups  : {bak_dir}")
+    linked = f"User {user_id}" if user_id else "not linked"
+    print(f"  Discord  : {linked}")
     print(f"  Tray icon active — right-click it to open folder or quit.")
 
     run_tray([tailer], [output_dir], on_event)

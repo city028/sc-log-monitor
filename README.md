@@ -1,17 +1,18 @@
 # SC Log Monitor
 
-A lightweight Windows system-tray app that watches the Star Citizen `Game.log` in real time, detects blueprint drops, and uploads a persistent record to a Discord channel via webhook.
+A lightweight Windows system-tray app that watches the Star Citizen `Game.log` in real time, detects blueprint drops, and sends them to a Discord channel via a Webhook-to-Bot Bridge.
 
 ---
 
 ## Features
 
-- Detects blueprint drop notifications from `Game.log`
-- Appends each blueprint to a single persistent `blueprints.json` file
-- Automatically backs up the JSON before every write (configurable max backups)
-- Uploads the full JSON to Discord at end of session, or on demand from the tray menu
+- Detects blueprint drop notifications from `Game.log` in real time
+- Appends each blueprint to a single persistent `blueprints.json` file (local backup)
+- Backs up `blueprints.json` before every write (configurable max backups)
+- Sends each blueprint immediately as a structured Discord embed via webhook
+- Per-user identity via a one-time `/linkapp` token handshake (no shared webhook attribution)
 - System tray icon with live session count and right-click menu
-- All settings configurable via in-app Settings dialog — no manual file editing needed
+- All settings configurable via an in-app Settings dialog — no manual file editing
 
 ---
 
@@ -32,12 +33,12 @@ requests>=2.31.0
 
 1. Clone or download the repository
 2. Install dependencies: `pip install -r requirements.txt`
-3. Copy `config.ini.example` to `config.ini` and add your Discord webhook URL
+3. Copy `config.ini.example` to `config.ini`
 4. Launch via `launch.vbs` (runs silently, no console window) or `python sc_log_monitor.py`
 5. On first run, output and backup directories default to:
    - Output: `Documents\Blueprints\blueprints.json`
    - Backups: `Documents\Blueprints\bak\`
-6. Right-click the tray icon → **Settings** to adjust any paths or settings
+6. Right-click the tray icon → **Settings** to configure paths and Discord
 
 ---
 
@@ -45,14 +46,38 @@ requests>=2.31.0
 
 All settings are stored in `config.ini` and editable via the Settings dialog:
 
+### General tab
+
 | Setting | Description | Default |
 |---------|-------------|---------|
 | Game log file | Path to Star Citizen `Game.log` | `C:\Program Files\Roberts Space Industries\StarCitizen\LIVE\Game.log` |
 | Output directory | Where `blueprints.json` is written | `Documents\Blueprints` |
 | Backup directory | Where timestamped backups are stored | `Documents\Blueprints\bak` |
-| Discord webhook URL | Webhook to post the JSON file to | _(empty)_ |
-| Poll interval | How often to check the log (seconds) | `1.0` |
 | Max backups | How many backup files to keep | `10` |
+| Poll interval | How often to check the log (seconds) | `1.0` |
+
+### Discord tab
+
+| Setting | Description |
+|---------|-------------|
+| Webhook URL | Channel webhook URL (provided by your server admin) |
+| Bot API URL | Base URL of the bot's link-status endpoint (provided by your server admin) |
+| Link Token | One-time token from `/linkapp` in Discord — enter and click **Link Account** to pair |
+| Discord User ID | Populated automatically after successful link |
+| Guild Token | Populated automatically after successful link — identifies you to the bot |
+
+> **Security note:** Webhook URLs and bot API URLs should be provided by your server administrator during setup. Do not share them publicly.
+
+---
+
+## First-time Discord setup
+
+1. In your Discord server run `/linkapp` — the bot responds with a one-time token
+2. Open tray → **Settings** → **Discord** tab
+3. Fill in **Webhook URL** and **Bot API URL** (provided by your admin)
+4. Paste the token into **Link Token** and click **Link Account**
+5. Wait up to 60 seconds — **Discord User ID** and **Guild Token** will populate when the bot confirms
+6. Click **Save** — the app is now paired and will send embeds under your Discord identity
 
 ---
 
@@ -71,7 +96,7 @@ All settings are stored in `config.ini` and editable via the Settings dialog:
 ]
 ```
 
-A flat list — one entry per blueprint, ordered by time of detection. The file grows across all sessions indefinitely.
+A flat list — one entry per blueprint, ordered by detection time. Grows indefinitely across all sessions.
 
 ---
 
@@ -79,18 +104,18 @@ A flat list — one entry per blueprint, ordered by time of detection. The file 
 
 | Item | Action |
 |------|--------|
-| Refresh stats | Updates the tooltip with the current session count |
-| Upload to Discord now | Manually triggers a Discord upload of the full JSON |
-| Settings | Opens the settings dialog |
+| Refresh stats | Updates the tooltip with the current session count and link status |
+| Upload to Discord now | Resends all local blueprints.json entries as individual Discord embeds |
+| Settings | Opens the settings dialog (General + Discord tabs) |
 | Open output folder | Opens the output directory in Explorer |
-| Quit | Uploads to Discord (if blueprints received this session) then exits |
+| Quit | Exits the app |
 
 ---
 
 ## Discord upload behaviour
 
-- Upload triggers automatically at **end of session**: when SC restarts (log file replaced) or when the user clicks Quit
-- Upload only fires if at least one blueprint was received in the current session
-- A manual upload is always available via the tray menu regardless of session state
-- On upload failure a dialog is shown with the error message
-- Discord webhook file uploads support up to 8 MB (the JSON file is unlikely to approach this)
+- Each blueprint is sent **immediately on detection** as a structured embed via the configured webhook
+- The embed contains your Discord User ID and Guild Token so the bot can attribute and validate the entry
+- The bot processes the embed and deletes the message from the channel
+- A local copy is always written to `blueprints.json` first — embeds can be resent any time via **Upload to Discord now**
+- On upload failure a dialog is shown with the error; local data is never lost

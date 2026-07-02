@@ -10,15 +10,15 @@ A lightweight Windows system-tray app that watches the Star Citizen `Game.log` i
 - Appends each blueprint to a single persistent `blueprints.json` file
 - Automatically backs up the JSON before every write (configurable max backups)
 - Uploads the full JSON to Discord at end of session, or on demand from the tray menu
-- System tray icon with live session stats and right-click menu
-- All settings configurable via in-app Settings dialog (no manual config editing needed)
+- System tray icon with live session count and right-click menu
+- All settings configurable via in-app Settings dialog — no manual file editing needed
 
 ---
 
 ## Requirements
 
 - Python 3.11+
-- Dependencies: `pip install -r requirements.txt`
+- Install dependencies: `pip install -r requirements.txt`
 
 ```
 pystray==0.19.5
@@ -32,11 +32,12 @@ requests>=2.31.0
 
 1. Clone or download the repository
 2. Install dependencies: `pip install -r requirements.txt`
-3. Launch via `launch.vbs` (runs silently, no console window) or `python sc_log_monitor.py`
-4. On first run, output and backup directories default to:
+3. Copy `config.ini.example` to `config.ini` and add your Discord webhook URL
+4. Launch via `launch.vbs` (runs silently, no console window) or `python sc_log_monitor.py`
+5. On first run, output and backup directories default to:
    - Output: `Documents\Blueprints\blueprints.json`
    - Backups: `Documents\Blueprints\bak\`
-5. Right-click the tray icon → **Settings** to configure paths and Discord webhook
+6. Right-click the tray icon → **Settings** to adjust any paths or settings
 
 ---
 
@@ -86,17 +87,10 @@ A flat list — one entry per blueprint, ordered by time of detection. The file 
 
 ---
 
-## Known limitations
-
-- aUEC payout amounts are not reliably logged by Star Citizen — the monitor does not track them
-- The `death_onfoot` pattern can fire on ALT-F4 (client-side cleanup) rather than a true in-game death — this was observed and left in for further data gathering
-- Discord webhook file uploads are limited to 8 MB (the JSON file is unlikely to approach this)
-
----
-
 ## Discord upload behaviour
 
 - Upload triggers automatically at **end of session**: when SC restarts (log file replaced) or when the user clicks Quit
 - Upload only fires if at least one blueprint was received in the current session
 - A manual upload is always available via the tray menu regardless of session state
 - On upload failure a dialog is shown with the error message
+- Discord webhook file uploads support up to 8 MB (the JSON file is unlikely to approach this)

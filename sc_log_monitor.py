@@ -52,8 +52,7 @@ def load_config() -> configparser.ConfigParser:
 
 def save_config(log_file: str, output_dir: str, bak_dir: str,
                 max_backups: str, poll_interval: str,
-                webhook_url: str, bot_api_url: str,
-                user_id: str, guild_token: str) -> None:
+                webhook_url: str, user_id: str, guild_token: str) -> None:
     """Write all settings back to config.ini."""
     config = configparser.ConfigParser()
     config.read(CONFIG_FILE, encoding="utf-8")
@@ -72,7 +71,6 @@ def save_config(log_file: str, output_dir: str, bak_dir: str,
     if not config.has_section("discord"):
         config.add_section("discord")
     config.set("discord", "webhook_url", webhook_url)
-    config.set("discord", "bot_api_url", bot_api_url)
     config.set("discord", "user_id",     user_id)
     config.set("discord", "guild_token", guild_token)
 
@@ -224,50 +222,94 @@ def resend_all_from_local(webhook_url: str, user_id: str, guild_token: str,
 # Link account handshake
 # ---------------------------------------------------------------------------
 
-def link_account(webhook_url: str, bot_api_url: str, link_token: str,
-                 on_success, on_failure) -> None:
-    """One-time pairing flow: POST link token via webhook, poll bot API for response.
+def _parse_webhook_parts(webhook_url: str) -> tuple[str, str]:
+    """Extract (webhook_id, webhook_token) from a Discord webhook URL."""
+    # URL form: https://discord.com/api/webhooks/{id}/{token}
+    parts = webhook_url.rstrip("/").split("/")
+    if len(parts) < 2:
+        raise ValueError("Invalid webhook URL")
+    return parts[-2], parts[-1]
 
-    on_success(user_id, guild_token) — called when pairing confirmed.
-    on_failure(message)              — called on timeout or error.
-    Runs in the calling thread — callers should spawn a daemon thread.
+
+def link_account(webhook_url: str, link_token: str, on_success, on_failure) -> None:
+    """One-time pairing flow using the webhook message as a shared mailbox.
+
+    Flow:
+      1. POST a link-request embed to the webhook with ?wait=true → get message_id.
+      2. Bot sees the message via gateway, resolves link_token → user_id, edits the
+         message title to "Application Link SUCCESS" and writes user_id into a field.
+      3. App polls GET /webhooks/{id}/{token}/messages/{message_id} every 2 s until
+         the title matches, then reads user_id and deletes the message.
+
+    on_success(user_id) — called with the resolved Discord user ID.
+    on_failure(message) — called on timeout or HTTP error.
+    Runs in the calling thread — spawn a daemon thread before calling.
     """
-    if not webhook_url or not bot_api_url or not link_token:
-        on_failure("Webhook URL, Bot API URL, and Link Token are all required.")
+    if not webhook_url or not link_token:
+        on_failure("Webhook URL and Link Token are both required.")
         return
 
-    # 1. Send the init payload to the webhook
     try:
-        init_payload = {
-            "content": "__LINK__",
-            "embeds": [{"footer": {"text": link_token.strip()}}],
-        }
-        resp = requests.post(webhook_url, json=init_payload, timeout=15)
-        if not resp.ok:
-            on_failure(f"Link init failed: HTTP {resp.status_code}")
-            return
-    except Exception as exc:
-        on_failure(f"Link init error: {exc}")
+        wh_id, wh_token = _parse_webhook_parts(webhook_url)
+    except ValueError:
+        on_failure("Webhook URL is not valid.")
         return
 
-    # 2. Poll the bot API for confirmation (up to 60 s)
-    poll_url = f"{bot_api_url.rstrip('/')}/link-status/{link_token.strip()}"
+    base = f"https://discord.com/api/webhooks/{wh_id}/{wh_token}"
+
+    # 1. POST the link-request embed; ?wait=true returns the created message JSON
+    try:
+        payload = {
+            "embeds": [{
+                "title": "Application Link Request",
+                "footer": {"text": link_token.strip()},
+            }]
+        }
+        resp = requests.post(f"{base}?wait=true", json=payload, timeout=15)
+        if not resp.ok:
+            on_failure(f"Link request failed: HTTP {resp.status_code}")
+            return
+        message_id = resp.json()["id"]
+    except Exception as exc:
+        on_failure(f"Link request error: {exc}")
+        return
+
+    # 2. Poll the message until the bot edits the title to the success sentinel
+    msg_url  = f"{base}/messages/{message_id}"
     deadline = time.monotonic() + 60
+    user_id  = None
     while time.monotonic() < deadline:
         time.sleep(2)
         try:
-            r = requests.get(poll_url, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                on_success(data["user_id"], data["guild_token"])
+            r = requests.get(msg_url, timeout=10)
+            if not r.ok:
+                on_failure(f"Poll error: HTTP {r.status_code}")
+                _try_delete_message(msg_url)
                 return
-            elif r.status_code != 404:
-                on_failure(f"Bot API error: HTTP {r.status_code}")
-                return
+            data   = r.json()
+            embeds = data.get("embeds", [])
+            if embeds and embeds[0].get("title") == "Application Link SUCCESS":
+                # Bot writes user_id into the first field value
+                fields  = embeds[0].get("fields", [])
+                user_id = fields[0]["value"] if fields else None
+                break
         except Exception:
-            pass  # transient error — keep polling
+            pass  # transient — keep polling
 
-    on_failure("Link timed out after 60 seconds. Try /linkapp again in Discord.")
+    # 3. Delete the handshake message regardless of outcome
+    _try_delete_message(msg_url)
+
+    if user_id:
+        on_success(user_id)
+    else:
+        on_failure("Link timed out after 60 seconds. Try /blueprint-link again in Discord.")
+
+
+def _try_delete_message(msg_url: str) -> None:
+    try:
+        requests.delete(msg_url, timeout=10)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +436,6 @@ def show_settings_dialog(on_saved):
         max_backups = config.get("paths",   "max_backups",   fallback="10")
         poll        = config.get("monitor", "poll_interval", fallback="1.0")
         webhook     = config.get("discord", "webhook_url",   fallback="")
-        bot_api     = config.get("discord", "bot_api_url",   fallback="")
         user_id     = config.get("discord", "user_id",       fallback="")
         guild_token = config.get("discord", "guild_token",   fallback="")
 
@@ -462,10 +503,10 @@ def show_settings_dialog(on_saved):
         tk.Entry(tab_disc, textvariable=hook_var, width=55).grid(
             row=0, column=1, columnspan=2, sticky="we", **pad)
 
-        tk.Label(tab_disc, text="Bot API URL:", anchor="w").grid(
+        tk.Label(tab_disc, text="Guild Token:", anchor="w").grid(
             row=1, column=0, sticky="w", **pad)
-        api_var = tk.StringVar(value=bot_api)
-        tk.Entry(tab_disc, textvariable=api_var, width=55).grid(
+        gt_var = tk.StringVar(value=guild_token)
+        tk.Entry(tab_disc, textvariable=gt_var, width=55).grid(
             row=1, column=1, columnspan=2, sticky="we", **pad)
 
         ttk.Separator(tab_disc, orient="horizontal").grid(
@@ -473,7 +514,7 @@ def show_settings_dialog(on_saved):
         tk.Label(tab_disc, text="Link Account", font=("", 9, "bold")).grid(
             row=3, column=0, columnspan=3, sticky="w", padx=8)
         tk.Label(tab_disc,
-                 text="Run /linkapp in Discord, paste the token below, then click Link Account.",
+                 text="Run /blueprint-link in Discord, paste the token below, then click Link Account.",
                  anchor="w", foreground="grey").grid(
             row=4, column=0, columnspan=3, sticky="w", padx=8)
 
@@ -496,38 +537,30 @@ def show_settings_dialog(on_saved):
         tk.Entry(tab_disc, textvariable=uid_var, width=30, state="readonly").grid(
             row=7, column=1, sticky="w", **pad)
 
-        tk.Label(tab_disc, text="Guild Token:", anchor="w").grid(
-            row=8, column=0, sticky="w", **pad)
-        gt_var = tk.StringVar(value=guild_token)
-        tk.Entry(tab_disc, textvariable=gt_var, width=30, state="readonly").grid(
-            row=8, column=1, sticky="w", **pad)
-
         def do_link():
             link_status.set("Linking…")
-            def on_success(uid, gt):
+            def on_success(uid):
                 uid_var.set(uid)
-                gt_var.set(gt)
                 token_var.set("")
                 link_status.set("Linked!")
-                # Persist immediately
                 save_config(
                     log_var.get().strip(), dir_var.get().strip(),
                     bak_var.get().strip(), bak_count_var.get().strip(),
                     poll_var.get().strip(), hook_var.get().strip(),
-                    api_var.get().strip(), uid, gt,
+                    uid, gt_var.get().strip(),
                 )
             def on_fail(msg):
                 link_status.set("Failed")
                 _show_message("Link Failed", msg)
             threading.Thread(
                 target=link_account,
-                args=(hook_var.get().strip(), api_var.get().strip(),
-                      token_var.get().strip(), on_success, on_fail),
+                args=(hook_var.get().strip(), token_var.get().strip(),
+                      on_success, on_fail),
                 daemon=True, name="link-account",
             ).start()
 
         tk.Button(tab_disc, text="Link Account", command=do_link).grid(
-            row=9, column=1, sticky="w", **pad)
+            row=8, column=1, sticky="w", **pad)
 
         # ── Save / Cancel ─────────────────────────────────────────────────
         btn_frame = tk.Frame(root)
@@ -548,8 +581,7 @@ def show_settings_dialog(on_saved):
                 log_var.get().strip(), dir_var.get().strip(),
                 bak_var.get().strip(), bak_count_var.get().strip(),
                 poll_var.get().strip(), hook_var.get().strip(),
-                api_var.get().strip(), uid_var.get().strip(),
-                gt_var.get().strip(),
+                uid_var.get().strip(), gt_var.get().strip(),
             )
             root.destroy()
             on_saved()
@@ -631,7 +663,6 @@ def run_tray(tailer_ref: list, output_dir_ref: list, on_event_fn):
             max_backups = config.getint("paths",    "max_backups",   fallback=10)
             poll_sec    = config.getfloat("monitor", "poll_interval", fallback=1.0)
             webhook     = config.get("discord", "webhook_url",  fallback="")
-            bot_api     = config.get("discord", "bot_api_url",  fallback="")
             user_id     = config.get("discord", "user_id",      fallback="")
             guild_token = config.get("discord", "guild_token",  fallback="")
             output_dir_ref[0] = output_dir
@@ -681,14 +712,13 @@ def main():
     max_backups = config.getint("paths",    "max_backups",   fallback=10)
     poll_sec    = config.getfloat("monitor", "poll_interval", fallback=1.0)
     webhook     = config.get("discord", "webhook_url",  fallback="")
-    bot_api     = config.get("discord", "bot_api_url",  fallback="")
     user_id     = config.get("discord", "user_id",      fallback="")
     guild_token = config.get("discord", "guild_token",  fallback="")
 
     if not config.has_option("paths", "output_dir") or not config.has_option("paths", "bak_dir"):
         save_config(str(log_path), str(output_dir), str(bak_dir),
                     str(max_backups), str(poll_sec),
-                    webhook, bot_api, user_id, guild_token)
+                    webhook, user_id, guild_token)
 
     def on_event(event_type: str, attrs: dict):
         ts = datetime.now().strftime("%H:%M:%S")

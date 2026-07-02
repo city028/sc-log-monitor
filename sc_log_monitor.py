@@ -289,9 +289,10 @@ def link_account(webhook_url: str, link_token: str, on_success, on_failure) -> N
             data   = r.json()
             embeds = data.get("embeds", [])
             if embeds and embeds[0].get("title") == "Application Link SUCCESS":
-                # Bot writes user_id into the first field value
-                fields  = embeds[0].get("fields", [])
-                user_id = fields[0]["value"] if fields else None
+                # Bot writes user_id into a field named "User_ID" and also the footer
+                fields    = embeds[0].get("fields", [])
+                uid_field = next((f for f in fields if f.get("name") == "User_ID"), None)
+                user_id   = uid_field["value"] if uid_field else embeds[0].get("footer", {}).get("text")
                 break
         except Exception:
             pass  # transient — keep polling

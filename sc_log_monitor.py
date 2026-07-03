@@ -103,8 +103,12 @@ def _blueprints_path(output_dir: Path) -> Path:
 
 
 def append_blueprint(output_dir: Path, bak_dir: Path, item: str,
-                     max_backups: int = 10) -> str:
-    """Backup blueprints.json, append the new entry, return UTC timestamp string."""
+                     max_backups: int = 10) -> tuple[str, bool]:
+    """Backup blueprints.json, add or update the entry, return (timestamp, is_new).
+
+    is_new=True  — item was not present, a new entry was appended.
+    is_new=False — item already existed, only the timestamp was updated.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     path = _blueprints_path(output_dir)
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -122,12 +126,18 @@ def append_blueprint(output_dir: Path, bak_dir: Path, item: str,
         else:
             data = []
 
-        data.append({"item": item, "timestamp": timestamp})
+        match = next((e for e in data if e["item"] == item), None)
+        if match:
+            match["timestamp"] = timestamp
+            is_new = False
+        else:
+            data.append({"item": item, "timestamp": timestamp})
+            is_new = True
 
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2)
 
-    return timestamp
+    return timestamp, is_new
 
 
 def _load_total_blueprints(output_dir: Path) -> int:
@@ -420,9 +430,10 @@ class LogTailer:
                 self._last_fired[event_type] = now
 
             attrs = pattern["build"](m)
-            timestamp = append_blueprint(self.output_dir, self.bak_dir,
-                                         attrs["item"], self.max_backups)
-            self.blueprints_session += 1
+            timestamp, is_new = append_blueprint(self.output_dir, self.bak_dir,
+                                                 attrs["item"], self.max_backups)
+            if is_new:
+                self.blueprints_session += 1
 
             threading.Thread(
                 target=post_blueprint_embed,
@@ -432,7 +443,7 @@ class LogTailer:
                 name="discord-embed",
             ).start()
 
-            self.on_event(event_type, attrs)
+            self.on_event(event_type, attrs, is_new)
             break
 
 
@@ -750,10 +761,13 @@ def main():
                     str(max_backups), str(poll_sec),
                     webhook, user_id, guild_token)
 
-    def on_event(event_type: str, attrs: dict):
+    def on_event(event_type: str, attrs: dict, is_new: bool = True):
         ts = datetime.now().strftime("%H:%M:%S")
         if event_type == "blueprint":
-            print(f"[{ts}] Blueprint received: {attrs['item']}")
+            if is_new:
+                print(f"[{ts}] Blueprint received: {attrs['item']}")
+            else:
+                print(f"[{ts}] Blueprint already owned, timestamp updated: {attrs['item']}")
         else:
             print(f"[{ts}] {event_type}: {attrs}")
 

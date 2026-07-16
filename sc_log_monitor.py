@@ -528,6 +528,10 @@ def show_settings_dialog(on_saved):
         root.title("SC Log Monitor — Settings")
         root.resizable(False, False)
         root.attributes("-topmost", True)
+        try:
+            root.iconphoto(True, tk.PhotoImage(file=str(_ICON_PATH)))
+        except Exception:
+            pass
 
         nb  = ttk.Notebook(root)
         nb.pack(fill="both", expand=True, padx=8, pady=8)

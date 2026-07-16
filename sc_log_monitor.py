@@ -529,7 +529,10 @@ def show_settings_dialog(on_saved):
         root.resizable(False, False)
         root.attributes("-topmost", True)
         try:
-            root.iconphoto(True, tk.PhotoImage(file=str(_ICON_PATH)))
+            from PIL import ImageTk
+            _ico = Image.open(_ICON_PATH).resize((32, 32), Image.LANCZOS)
+            _ico_photo = ImageTk.PhotoImage(_ico)
+            root.iconphoto(True, _ico_photo)
         except Exception:
             pass
 

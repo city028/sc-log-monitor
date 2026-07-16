@@ -769,18 +769,18 @@ def main():
         shutil.copy2(legacy, CONFIG_FILE)
 
     config      = load_config()
-    log_path    = Path(config.get("paths",   "log_file"))
-    output_dir  = Path(config.get("paths",   "output_dir",
-                                   fallback=str(_default_output_dir())))
-    bak_dir     = Path(config.get("paths",   "bak_dir",
-                                   fallback=str(_default_bak_dir())))
+    _default_log = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE\Game.log"
+    log_path    = Path(config.get("paths",   "log_file",     fallback=_default_log))
+    output_dir  = Path(config.get("paths",   "output_dir",   fallback=str(_default_output_dir())))
+    bak_dir     = Path(config.get("paths",   "bak_dir",      fallback=str(_default_bak_dir())))
     max_backups = config.getint("paths",    "max_backups",   fallback=10)
     poll_sec    = config.getfloat("monitor", "poll_interval", fallback=1.0)
     webhook     = config.get("discord", "webhook_url",  fallback="")
     user_id     = config.get("discord", "user_id",      fallback="")
     guild_token = config.get("discord", "guild_token",  fallback="")
 
-    if not config.has_option("paths", "output_dir") or not config.has_option("paths", "bak_dir"):
+    # Write defaults on first run or if any section is missing
+    if not config.has_section("paths") or not config.has_section("discord"):
         save_config(str(log_path), str(output_dir), str(bak_dir),
                     str(max_backups), str(poll_sec),
                     webhook, user_id, guild_token)

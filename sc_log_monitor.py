@@ -725,12 +725,12 @@ def run_tray(tailer_ref: list, output_dir_ref: list, on_event_fn):
         icon=_make_icon(),
         title=tooltip(),
         menu=pystray.Menu(
-            pystray.MenuItem("Refresh stats",         on_stats),
-            pystray.MenuItem("Upload to Discord now", on_upload_now),
-            pystray.MenuItem("Settings",              on_settings),
-            pystray.MenuItem("Open output folder",    on_open_folder),
+            pystray.MenuItem("Settings",           on_settings),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", on_quit),
+            pystray.MenuItem("Sync to Discord",    on_upload_now),
+            pystray.MenuItem("Open Output Folder", on_open_folder),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit",               on_quit),
         ),
     )
 

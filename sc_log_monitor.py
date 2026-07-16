@@ -534,8 +534,10 @@ def show_settings_dialog(on_saved):
 
         tab_gen  = ttk.Frame(nb)
         tab_disc = ttk.Frame(nb)
+        tab_info = ttk.Frame(nb)
         nb.add(tab_gen,  text="General")
         nb.add(tab_disc, text="Discord")
+        nb.add(tab_info, text="Info")
 
         pad = {"padx": 8, "pady": 4}
 
@@ -669,6 +671,79 @@ def show_settings_dialog(on_saved):
 
         tk.Button(tab_disc, text="Reset Discord Settings", command=do_reset,
                   foreground="red").grid(row=10, column=1, sticky="w", **pad)
+
+        # ── Info tab ──────────────────────────────────────────────────────
+        info_text = (
+            "Hello,\n\n"
+            "Thank you for using the Star Citizen Log Monitor application. "
+            "This application monitors the Star Citizen Game.log file (path configurable) "
+            "for any Blueprint drops. When a drop is detected, the name of the blueprint "
+            "with the award date is added to a file (location configurable in settings) so "
+            "that you have an easy overview of all blueprints awarded to you.\n\n"
+            "This application works best with our Star Citizen Blueprint Discord Bot (see "
+            "details below). Once the log monitor is linked to the Bot it will automatically "
+            "upload your blueprint to the bot and make it visible to you and your organization. "
+            "This allows you to answer the question: \"Who has a blueprint for the ASD Ghost "
+            "Armor set?\" quickly if people in your org also use the app and the bot (although "
+            "the bot also offers Blueprint upload by screenshot). Please visit our support "
+            "Discord if you have any questions and or suggestions.\n\n"
+            "Best regards,\n\nCitygamer\n\n"
+            "Source code and updates of/for this application:\n"
+            "https://github.com/city028/sc-log-monitor\n\n"
+            "Star Citizen Blueprint Bot Support Discord:\n"
+            "https://discord.com/invite/m5uPvRWq5t\n\n"
+            "Star Citizen Blueprint Bot WIKI Pages:\n"
+            "https://github.com/city028/sc-blueprint-bot\n\n"
+            "If you like what you see, follow the link below to install the bot on your own "
+            "server or on that of your Org.\nDiscord Invite Link:\n"
+            "https://discord.com/oauth2/authorize?client_id=1493936820143259720\n\n"
+            "─────────────────────────────────────────────────────────────\n"
+            "This Discord Bot and its outputs are not endorsed by Cloud Imperium or Roberts "
+            "Space Industries group of companies. All game content and materials are copyright "
+            "Cloud Imperium Rights LLC and Cloud Imperium Rights Ltd.. Star Citizen®, "
+            "Squadron 42®, Roberts Space Industries®, and Cloud Imperium® are "
+            "registered trademarks of Cloud Imperium Rights LLC. All rights reserved."
+        )
+
+        links = [
+            "https://github.com/city028/sc-log-monitor",
+            "https://discord.com/invite/m5uPvRWq5t",
+            "https://github.com/city028/sc-blueprint-bot",
+            "https://discord.com/oauth2/authorize?client_id=1493936820143259720",
+        ]
+
+        txt_frame = tk.Frame(tab_info)
+        txt_frame.pack(fill="both", expand=True, padx=8, pady=8)
+        scrollbar = tk.Scrollbar(txt_frame)
+        scrollbar.pack(side="right", fill="y")
+        txt = tk.Text(txt_frame, wrap="word", width=60, height=20,
+                      yscrollcommand=scrollbar.set,
+                      relief="flat", padx=6, pady=6, cursor="arrow")
+        txt.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=txt.yview)
+        txt.tag_config("link", foreground="#0066cc", underline=True)
+        txt.insert("end", info_text)
+
+        def _open_url(url):
+            import webbrowser
+            webbrowser.open(url)
+
+        for url in links:
+            start = "1.0"
+            while True:
+                pos = txt.search(url, start, stopindex="end")
+                if not pos:
+                    break
+                end = f"{pos}+{len(url)}c"
+                tag = f"link_{url}"
+                txt.tag_add(tag, pos, end)
+                txt.tag_config(tag, foreground="#0066cc", underline=True)
+                txt.tag_bind(tag, "<Button-1>", lambda e, u=url: _open_url(u))
+                txt.tag_bind(tag, "<Enter>", lambda e: txt.config(cursor="hand2"))
+                txt.tag_bind(tag, "<Leave>", lambda e: txt.config(cursor="arrow"))
+                start = end
+
+        txt.config(state="disabled")
 
         # ── Save / Cancel ─────────────────────────────────────────────────
         btn_frame = tk.Frame(root)

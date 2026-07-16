@@ -152,6 +152,51 @@ def append_blueprint(output_dir: Path, bak_dir: Path, item: str,
     return timestamp, is_new
 
 
+# ---------------------------------------------------------------------------
+# Windows startup registry helpers
+# ---------------------------------------------------------------------------
+
+_STARTUP_REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_STARTUP_REG_NAME = "SC Log Monitor"
+
+
+def _is_bundled() -> bool:
+    return getattr(sys, "frozen", False)
+
+
+def _startup_enabled() -> bool:
+    """Return True if the app is registered to start with Windows."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY) as key:
+            winreg.QueryValueEx(key, _STARTUP_REG_NAME)
+            return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+def _set_startup(enabled: bool) -> None:
+    """Add or remove the Windows startup registry entry."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY,
+                            access=winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, _STARTUP_REG_NAME, 0,
+                                  winreg.REG_SZ, str(sys.executable))
+            else:
+                try:
+                    winreg.DeleteValue(key, _STARTUP_REG_NAME)
+                except FileNotFoundError:
+                    pass
+    except Exception as exc:
+        _show_message("Startup setting failed", str(exc))
+
+
+# ---------------------------------------------------------------------------
+
 def _load_total_blueprints(output_dir: Path) -> int:
     path = _blueprints_path(output_dir)
     if not path.exists():
@@ -536,6 +581,16 @@ def show_settings_dialog(on_saved):
         tk.Entry(tab_gen, textvariable=poll_var, width=10).grid(
             row=4, column=1, sticky="w", **pad)
 
+        # Default to checked when running as .exe but not yet registered
+        startup_var = tk.BooleanVar(value=_startup_enabled() or _is_bundled())
+        startup_cb  = tk.Checkbutton(tab_gen, text="Start with Windows",
+                                     variable=startup_var,
+                                     state="normal" if _is_bundled() else "disabled")
+        startup_cb.grid(row=5, column=1, sticky="w", **pad)
+        if not _is_bundled():
+            tk.Label(tab_gen, text="(only available in .exe mode)",
+                     foreground="grey", anchor="w").grid(row=5, column=2, sticky="w", **pad)
+
         # ── Discord tab ───────────────────────────────────────────────────
         tk.Label(tab_disc, text="Webhook URL:", anchor="w").grid(
             row=0, column=0, sticky="w", **pad)
@@ -636,6 +691,8 @@ def show_settings_dialog(on_saved):
                 poll_var.get().strip(), hook_var.get().strip(),
                 uid_var.get().strip(), gt_var.get().strip(),
             )
+            if _is_bundled():
+                _set_startup(startup_var.get())
             root.destroy()
             on_saved()
 

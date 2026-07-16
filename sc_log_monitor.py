@@ -661,10 +661,14 @@ def _make_icon() -> Image.Image:
 def run_tray(tailer_ref: list, output_dir_ref: list, on_event_fn):
     def tooltip() -> str:
         t = tailer_ref[0]
-        linked = "linked" if t.user_id else "not linked"
+        status = "linked" if t.user_id else "not linked"
+        total  = _load_total_blueprints(output_dir_ref[0])
         return (
             f"SC Log Monitor\n"
-            f"Session: {t.blueprints_session} blueprint(s) | {linked}"
+            f"--------------------\n"
+            f"Status: {status}\n"
+            f"Session Blueprints: {t.blueprints_session}\n"
+            f"Total Blueprints: {total}"
         )
 
     def on_open_folder(icon, item):

@@ -30,5 +30,5 @@ jobs:
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: "dist/SC Log Monitor.exe"
+          files: "dist/SC-Log-Monitor.exe"
           generate_release_notes: true

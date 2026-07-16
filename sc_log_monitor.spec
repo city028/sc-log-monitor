@@ -27,7 +27,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="SC Log Monitor",
+    name="SC-Log-Monitor",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -4,6 +4,18 @@ A lightweight Windows system-tray app that watches the Star Citizen `Game.log` i
 
 ---
 
+## Download & Install
+
+1. Go to the [Releases page](https://github.com/city028/sc-log-monitor/releases/latest)
+2. Download `SC Log Monitor.exe`
+3. Place it anywhere — Desktop, a dedicated folder, wherever you prefer
+4. Double-click to run — no installation required
+5. On first run, a config file is created automatically at `%LOCALAPPDATA%\SC Log Monitor\config.ini`
+
+> **First-time Discord setup** — see the [Discord setup section](#first-time-discord-setup) below.
+
+---
+
 ## Features
 
 - Detects blueprint drop notifications from `Game.log` in real time
@@ -17,7 +29,9 @@ A lightweight Windows system-tray app that watches the Star Citizen `Game.log` i
 
 ---
 
-## Requirements
+## Requirements (running from source)
+
+> Skip this section if you downloaded the `.exe` from the Releases page.
 
 - Python 3.11+
 - Install dependencies: `pip install -r requirements.txt`
@@ -28,18 +42,9 @@ Pillow==12.2.0
 requests>=2.31.0
 ```
 
----
+Run with: `python sc_log_monitor.py` or `launch.vbs` (suppresses the console window).
 
-## Installation
-
-1. Clone or download the repository
-2. Install dependencies: `pip install -r requirements.txt`
-3. Copy `config.ini.example` to `config.ini`
-4. Launch via `launch.vbs` (runs silently, no console window) or `python sc_log_monitor.py`
-5. On first run, output and backup directories default to:
-   - Output: `Documents\Blueprints\blueprints.json`
-   - Backups: `Documents\Blueprints\bak\`
-6. Right-click the tray icon → **Settings** to configure paths and Discord
+Config is stored at `%LOCALAPPDATA%\SC Log Monitor\config.ini` in both the `.exe` and source modes.
 
 ---
 

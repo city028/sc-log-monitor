@@ -6,6 +6,7 @@ and sends a structured Discord embed via webhook for bot processing.
 
 import os
 import re
+import sys
 import time
 import shutil
 import threading
@@ -22,7 +23,18 @@ from PIL import Image, ImageDraw, ImageFont
 # Configuration
 # ---------------------------------------------------------------------------
 
-CONFIG_FILE = Path(__file__).parent / "config.ini"
+def _get_appdata_dir() -> Path:
+    local = os.environ.get("LOCALAPPDATA")
+    return Path(local) if local else Path.home() / "AppData" / "Local"
+
+
+CONFIG_FILE = _get_appdata_dir() / "SC Log Monitor" / "config.ini"
+
+
+def _resource_path(relative: str) -> Path:
+    """Resolve a bundled asset — works both from source and inside a PyInstaller .exe."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / relative
 
 
 def _get_documents_dir() -> Path:
@@ -639,7 +651,7 @@ def show_settings_dialog(on_saved):
 # System tray
 # ---------------------------------------------------------------------------
 
-_ICON_PATH = Path(__file__).parent / "src" / "bot-avatar.png"
+_ICON_PATH = _resource_path("src/bot-avatar.png")
 
 
 def _make_icon() -> Image.Image:
@@ -748,6 +760,14 @@ def run_tray(tailer_ref: list, output_dir_ref: list, on_event_fn):
 # ---------------------------------------------------------------------------
 
 def main():
+    # Ensure config directory exists
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    # Migrate legacy config.ini from alongside the exe (one-time, silent)
+    legacy = Path(sys.executable).parent / "config.ini"
+    if not CONFIG_FILE.exists() and legacy.exists():
+        shutil.copy2(legacy, CONFIG_FILE)
+
     config      = load_config()
     log_path    = Path(config.get("paths",   "log_file"))
     output_dir  = Path(config.get("paths",   "output_dir",

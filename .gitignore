@@ -12,3 +12,7 @@ sync.ffs_db
 
 # Secrets — config contains webhook URL, exclude from public repo
 config.ini
+
+# PyInstaller build artifacts
+dist/
+build/

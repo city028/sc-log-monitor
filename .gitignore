@@ -16,3 +16,7 @@ config.ini
 # PyInstaller build artifacts
 dist/
 build/
+
+# Developer-only files
+CLAUDE.md
+launch.vbs
